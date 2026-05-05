@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+title: mbX Pro
+message: >-
+  If you use mbX Pro, please cite the underlying mbX paper (the dedicated
+  mbX Pro paper is in preparation).
+type: software
+authors:
+  - given-names: Utsav
+    family-names: Lamichhane
+    affiliation: "University of Georgia, Department of Animal and Dairy Science"
+  - given-names: Jeferson
+    family-names: Lourenco
+    affiliation: "University of Georgia, Department of Animal and Dairy Science"
+version: "1.0.0"
+date-released: "2026-04-30"
+license: MIT
+preferred-citation:
+  type: article
+  title: "mbX: An R Package for Streamlined Microbiome Analysis"
+  authors:
+    - family-names: Lamichhane
+      given-names: Utsav
+    - family-names: Lourenco
+      given-names: Jeferson
+  journal: "Stats"
+  volume: "8"
+  issue: "2"
+  start: "44"
+  year: 2025
+  doi: "10.3390/stats8020044"
+  url: "https://www.mdpi.com/2571-905X/8/2/44"

@@ -1,0 +1,645 @@
+#!/usr/bin/env bash
+# =============================================================================
+#  mbXPro  —  Single-command end-to-end 16S rRNA microbiome pipeline
+# =============================================================================
+#
+#  PURPOSE
+#    Runs every step of the mbX Pro pipeline (steps 0 -> 18) in the correct
+#    order with one command and one shared output directory.  The user does
+#    NOT need to know any internal command, parameter, or file path.
+#
+#  USAGE
+#    mbXPro <fastq_dir> <metadata_file>
+#    mbXPro <fastq_dir> <metadata_file> [OPTIONS]
+#
+#  POSITIONAL ARGUMENTS
+#    <fastq_dir>       Directory containing the raw paired-end FASTQ files
+#                      (.fastq.gz).  May contain just FASTQ files OR
+#                      sub-folders of FASTQ files (auto-detected).
+#    <metadata_file>   QIIME2-format metadata file (.txt / .tsv / .csv)
+#                      with sample-id as the first column.
+#
+#  OPTIONS
+#    --resume                Reuse the most-recent existing mbX_pro_outputs_*
+#                            directory (alongside <fastq_dir>) instead of
+#                            creating a new one.  Idempotent steps will be
+#                            skipped automatically.
+#    --out <dir>             Force a specific output directory (overrides
+#                            both auto-create and --resume).  Use only if
+#                            you want to reuse a custom-named directory.
+#    --from <step>           Skip steps before this one (0-18).  Useful for
+#                            debugging.  Earlier steps must already exist.
+#    --to <step>             Stop after this step (0-18).
+#    --skip <list>           Comma-separated list of step IDs to skip
+#                            (e.g. --skip 15,17  to skip PICRUSt + networks).
+#    --forward-primer <SEQ>  Manual forward primer (5'->3').  Skips step 0
+#                            primer auto-detection and is recorded as
+#                            DETECTION_STATUS=USER_SUPPLIED.  Use only if
+#                            you know your primers and want to bypass
+#                            detection (the auto-detection is robust enough
+#                            that you usually do NOT need this).
+#    --reverse-primer <SEQ>  Manual reverse primer (5'->3').
+#    --no-pdf                Skip PDF rendering in step 18 (HTML only).
+#    --threads N             Override auto-detected CPU thread count.
+#    --keep-going            Continue running subsequent steps even if a
+#                            step fails (default: abort on first failure).
+#    --dry-run               Print the commands that would run without
+#                            executing them.
+#    --skip-zenodo           Skip the v1.2.0 pre-trained Zenodo classifier
+#                            attempt at step 5 and go straight to local
+#                            training (use behind offline / corporate
+#                            firewalls, or for fully reproducible runs).
+#    -h, --help              Show this help and exit.
+#
+#  WHAT IF NO PRIMERS ARE FOUND?
+#    Some sequencing facilities trim primers off before delivery.  When
+#    step 0 sees that, it sets DETECTION_STATUS=TRIMMED (or UNKNOWN if it
+#    cannot tell) and the pipeline AUTOMATICALLY switches to FULL-LENGTH
+#    classifier mode at step 5: extract-reads is skipped and Naive-Bayes
+#    runs against the entire Greengenes2 backbone.  Trim-left is set to 0
+#    when DETECTION_STATUS=TRIMMED, and to 20 (defensive default) when it
+#    is UNKNOWN.  No user intervention is required.
+#
+#  WHERE DOES THE FULL-LENGTH CLASSIFIER COME FROM?
+#    Step 5 first tries to download a pre-trained, sha256-verified
+#    Naive-Bayes classifier from
+#      https://zenodo.org/records/20021035
+#    matching your active QIIME2 version (8 versions are pre-built:
+#    QIIME2 2023.2, 2023.5, 2023.7, 2023.9, 2024.2, 2024.5, 2024.10, 2025.4).
+#    If a compatible classifier is found AND its sha256 verifies, the
+#    pipeline saves 30-90 minutes of local training time.  If anything
+#    goes wrong (no match, network failure, sha256 mismatch, the
+#    classifier fails to load in classify-sklearn), the pipeline silently
+#    falls back to local training using the GG2 backbone -- exactly as
+#    in mbX Pro <= 1.1.x.  The pipeline NEVER aborts because of Zenodo
+#    issues.  The final report records which path was taken
+#    (CLASSIFIER_SOURCE = zenodo | cached | local-training |
+#    local-training-fallback).
+#
+#  OUTPUT
+#    A single directory next to your FASTQ folder:
+#      <parent_of_fastq>/mbX_pro_outputs_<YYYYMMDD_HHMMSS>/
+#        ├── 0_primer_handling/             (step 0)
+#        ├── 1_manifest_file/                (step 1)
+#        ├── ... up through ...
+#        ├── 17_co_occurrence_networks/     (step 17)
+#        ├── 18_final_report/                (step 18 -- HTML + PDF)
+#        └── _pipeline_log/                  (full per-step run logs)
+#
+#  EXAMPLES
+#    Standard run (uses primer auto-detection):
+#      mbXPro /data/myproject/FASTQ /data/myproject/metadata.txt
+#
+#    Pre-trimmed primers (sequencing facility removed them already):
+#      mbXPro /data/myproject/FASTQ /data/myproject/metadata.txt \
+#             --forward-primer CCTACGGGNGGCWGCAG \
+#             --reverse-primer GACTACHVGGGTATCTAATCC
+#
+#    Resume an aborted run:
+#      mbXPro /data/myproject/FASTQ /data/myproject/metadata.txt --resume
+#
+#    Skip the slowest optional steps:
+#      mbXPro /data/myproject/FASTQ /data/myproject/metadata.txt \
+#             --skip 15,16,17
+#
+#  REQUIREMENTS
+#    * macOS (Bash 3.2+) or Linux (Bash 3.2+)
+#    * QIIME2 conda environment (default name: qiime2-amplicon-2025.4)
+#    * R installed system-wide (Homebrew on macOS):  brew install r
+#    * All 19 mbX Pro step scripts installed in $PATH (typically ~/bin/)
+#
+# =============================================================================
+
+set -euo pipefail
+
+# ── Pretty-print helpers ──────────────────────────────────────────────────────
+sep()   { printf '\n────────────────────────────────────────────────────────────────\n'; }
+hdr()   { printf '\n┌─────────────────────────────────────────────────────────────────\n│  %s\n└─────────────────────────────────────────────────────────────────\n' "$*"; }
+info()  { printf '[INFO]  %s\n' "$*"; }
+ok()    { printf '[OK]    %s\n' "$*"; }
+warn()  { printf '[WARN]  %s\n' "$*" >&2; }
+err()   { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+step()  { printf '\n══════════════════════════════════════════════════════════════════\n  STEP %s -- %s\n══════════════════════════════════════════════════════════════════\n' "$1" "$2"; }
+
+_abspath() {
+  if [[ -d "$1" ]]; then (cd "$1" && pwd)
+  elif [[ -f "$1" ]]; then echo "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
+  else echo "$1"
+  fi
+}
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+_show_help() {
+  # Print the comment block that ends with the third "# ===" fence line
+  # (header has three: top, after-title, bottom).
+  awk '/^# ===/ {n++; next}
+       n>=2 {if (/^#/) {sub(/^# ?/, ""); print} else {if (NF==0) print}}
+       n>=3 {exit}' "$0"
+}
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  _show_help; exit 0
+fi
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+FASTQ_DIR=""
+META_FILE=""
+RESUME=false
+FORCE_OUT=""
+FROM_STEP=0
+TO_STEP=18
+SKIP_LIST=""
+FWD_PRIMER=""
+REV_PRIMER=""
+NO_PDF=false
+THREADS=""
+KEEP_GOING=false
+DRY_RUN=false
+SKIP_ZENODO=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resume)         RESUME=true;       shift ;;
+    --out)            FORCE_OUT="$2";    shift 2 ;;
+    --from)           FROM_STEP="$2";    shift 2 ;;
+    --to)             TO_STEP="$2";      shift 2 ;;
+    --skip)           SKIP_LIST="$2";    shift 2 ;;
+    --forward-primer) FWD_PRIMER="$2";   shift 2 ;;
+    --reverse-primer) REV_PRIMER="$2";   shift 2 ;;
+    --no-pdf)         NO_PDF=true;       shift ;;
+    --threads)        THREADS="$2";      shift 2 ;;
+    --keep-going)     KEEP_GOING=true;   shift ;;
+    --dry-run)        DRY_RUN=true;      shift ;;
+    --skip-zenodo)    SKIP_ZENODO=true;  shift ;;
+    -h|--help)
+      _show_help; exit 0 ;;
+    -*)
+      err "Unknown option: $1
+  Run: mbXPro --help" ;;
+    *)
+      if   [[ -z "$FASTQ_DIR" ]]; then FASTQ_DIR="$1"; shift
+      elif [[ -z "$META_FILE" ]]; then META_FILE="$1"; shift
+      else err "Too many positional arguments.
+  Expected: mbXPro <fastq_dir> <metadata_file>"
+      fi ;;
+  esac
+done
+
+[[ -z "$FASTQ_DIR" ]] && err "Missing required argument: <fastq_dir>
+  Usage: mbXPro <fastq_dir> <metadata_file>
+  Run:   mbXPro --help"
+[[ -z "$META_FILE" ]] && err "Missing required argument: <metadata_file>
+  Usage: mbXPro <fastq_dir> <metadata_file>
+  Run:   mbXPro --help"
+
+[[ -d "$FASTQ_DIR" ]] || err "FASTQ directory does not exist: $FASTQ_DIR"
+[[ -f "$META_FILE" ]] || err "Metadata file does not exist: $META_FILE"
+
+FASTQ_DIR="$(_abspath "$FASTQ_DIR")"
+META_FILE="$(_abspath "$META_FILE")"
+
+# ── Pre-flight: count FASTQ files ─────────────────────────────────────────────
+N_FQ_HERE="$(find "$FASTQ_DIR" -maxdepth 1 -type f \
+  \( -iname '*.fastq.gz' -o -iname '*.fq.gz' -o -iname '*.fastq' -o -iname '*.fq' \) 2>/dev/null | wc -l | tr -d ' ')"
+N_FQ_DEEP="$(find "$FASTQ_DIR" -maxdepth 3 -type f \
+  \( -iname '*.fastq.gz' -o -iname '*.fq.gz' -o -iname '*.fastq' -o -iname '*.fq' \) 2>/dev/null | wc -l | tr -d ' ')"
+if [[ "$N_FQ_DEEP" -eq 0 ]]; then
+  err "No FASTQ files (*.fastq.gz / *.fq.gz / *.fastq / *.fq) found in
+  $FASTQ_DIR  (and up to 3 levels of sub-directories).
+  -> Verify the path actually contains your raw sequencing files."
+fi
+
+# ── Pre-flight: required scripts ──────────────────────────────────────────────
+REQUIRED_SCRIPTS=(
+  mbx_primer_identifier.sh
+  create_manifest.sh
+  artifact_creator.sh
+  mbx_dada2_parameter_finder.sh
+  mbx_dada2_run.sh
+  mbx_classifier_arranger.sh
+  mbx_classifier_run.sh
+  mbx_taxonomy_run.sh
+  mbx_ezclean_all_levels.sh
+  mbx_ezviz_all_levels_all_treatments.sh
+  mbx_ezstat_all_levels_all_treatments.sh
+  mbx_pre_diversity_parameters.sh
+  mbx_alpha_diversity_run.sh
+  mbx_beta_diversity_run.sh
+  mbx_ancombc2_run.sh
+  mbx_picrust_run.sh
+  mbx_ml_classifier_run.sh
+  mbx_network_run.sh
+  mbx_final_report.sh
+)
+MISSING_SCRIPTS=""
+for s in "${REQUIRED_SCRIPTS[@]}"; do
+  command -v "$s" >/dev/null 2>&1 || MISSING_SCRIPTS+="  $s
+"
+done
+if [[ -n "$MISSING_SCRIPTS" ]]; then
+  err "The following required step scripts are missing from your \$PATH:
+$MISSING_SCRIPTS
+  -> Install them via:  cp /path/to/repo/*.sh ~/bin/ && chmod +x ~/bin/*.sh
+  -> Then ensure ~/bin is in PATH:  export PATH=\"\$HOME/bin:\$PATH\""
+fi
+
+# ── Pre-flight: QIIME2 environment ────────────────────────────────────────────
+if ! command -v qiime &>/dev/null; then
+  err "QIIME2 'qiime' command not found.  You must run mbXPro from inside
+  an active QIIME2 conda environment.  Try:
+    conda activate qiime2-amplicon-2025.4
+  Then re-run:  mbXPro \"$FASTQ_DIR\" \"$META_FILE\""
+fi
+QIIME_VERSION="$(qiime --version 2>&1 | head -1 | awk '{print $NF}')"
+
+# ── Pre-flight: R + Rscript ───────────────────────────────────────────────────
+RSCRIPT_OK=false
+for _r in /usr/local/bin/Rscript /opt/homebrew/bin/Rscript /usr/bin/Rscript; do
+  [[ -x "$_r" ]] && { RSCRIPT_OK=true; RSCRIPT_BIN="$_r"; break; }
+done
+if ! $RSCRIPT_OK && command -v Rscript &>/dev/null; then
+  RSCRIPT_OK=true; RSCRIPT_BIN="$(command -v Rscript)"
+fi
+if ! $RSCRIPT_OK; then
+  err "Rscript not found.  R must be installed system-wide (NOT inside conda).
+  -> macOS:  brew install r
+  -> Debian / Ubuntu:  sudo apt-get install r-base
+  Then re-run mbXPro."
+fi
+
+# ── Threads ───────────────────────────────────────────────────────────────────
+if [[ -z "$THREADS" ]]; then
+  if command -v nproc &>/dev/null; then THREADS="$(nproc)"
+  elif command -v sysctl &>/dev/null; then THREADS="$(sysctl -n hw.logicalcpu 2>/dev/null || echo 1)"
+  else THREADS=1
+  fi
+fi
+
+# ── Resolve / create the SINGLE shared output directory ──────────────────────
+PARENT_DIR="$(dirname "$FASTQ_DIR")"
+
+if [[ -n "$FORCE_OUT" ]]; then
+  MBX_OUT_DIR="$(_abspath "$FORCE_OUT")"
+  mkdir -p "$MBX_OUT_DIR" || err "Cannot create --out dir: $MBX_OUT_DIR"
+  info "Using --out directory: $MBX_OUT_DIR"
+
+elif $RESUME; then
+  # Find the most-recent mbX_pro_outputs_* dir alongside FASTQ_DIR
+  CANDIDATE="$(ls -1d "$PARENT_DIR"/mbX_pro_outputs_* 2>/dev/null | sort -r | head -1)"
+  if [[ -z "$CANDIDATE" || ! -d "$CANDIDATE" ]]; then
+    warn "No existing mbX_pro_outputs_* directory found alongside FASTQ to resume."
+    warn "  -> Falling back to creating a new one."
+    TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
+    MBX_OUT_DIR="${PARENT_DIR}/mbX_pro_outputs_${TIMESTAMP}"
+    mkdir -p "$MBX_OUT_DIR" || err "Cannot create output dir: $MBX_OUT_DIR"
+  else
+    MBX_OUT_DIR="$CANDIDATE"
+    info "Resuming existing run : $MBX_OUT_DIR"
+  fi
+
+else
+  TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
+  MBX_OUT_DIR="${PARENT_DIR}/mbX_pro_outputs_${TIMESTAMP}"
+  if [[ -d "$MBX_OUT_DIR" ]]; then
+    err "Output directory already exists: $MBX_OUT_DIR
+  -> Use --resume to continue from an existing run, or wait one second and re-run."
+  fi
+  mkdir -p "$MBX_OUT_DIR" || err "Cannot create output dir: $MBX_OUT_DIR"
+fi
+
+export MBX_OUT_DIR
+
+LOG_DIR="${MBX_OUT_DIR}/_pipeline_log"
+mkdir -p "$LOG_DIR"
+PIPELINE_LOG="${LOG_DIR}/pipeline_master.log"
+PROVENANCE="${MBX_OUT_DIR}/mbXPro_run_info.txt"
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+RUN_START="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+clear 2>/dev/null || true
+cat <<BANNER
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║                                                                  ║
+  ║            mbX Pro -- One-Command Microbiome Pipeline            ║
+  ║                                                                  ║
+  ║         Raw FASTQ  ->  Functional + statistical insights         ║
+  ║         No internal commands or parameters to learn.             ║
+  ║                                                                  ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+BANNER
+info "Started at         : $RUN_START"
+info "FASTQ directory    : $FASTQ_DIR"
+info "Metadata file      : $META_FILE"
+info "Output directory   : $MBX_OUT_DIR"
+info "Pipeline log       : $PIPELINE_LOG"
+info "QIIME2 version     : $QIIME_VERSION"
+info "Rscript            : $RSCRIPT_BIN"
+info "CPU threads        : $THREADS"
+$RESUME      && info "Resume mode        : ON  (will skip already-completed steps)"
+$DRY_RUN     && warn "DRY-RUN mode       : commands will be printed, not executed"
+$KEEP_GOING  && info "Keep-going mode    : ON  (will not abort on step failure)"
+$SKIP_ZENODO && info "Zenodo classifier  : SKIPPED  (will train locally instead)"
+[[ -n "$FWD_PRIMER" ]] && info "Forward primer     : $FWD_PRIMER  (manual override)"
+[[ -n "$REV_PRIMER" ]] && info "Reverse primer     : $REV_PRIMER  (manual override)"
+[[ "$FROM_STEP" -gt 0 ]] && info "Starting at step   : $FROM_STEP"
+[[ "$TO_STEP"  -lt 18 ]] && info "Stopping at step   : $TO_STEP"
+[[ -n "$SKIP_LIST" ]] && info "Skipping steps     : $SKIP_LIST"
+sep
+
+# ── Step skip helper ──────────────────────────────────────────────────────────
+skip_requested() {
+  local id="$1"
+  [[ "$id" -lt "$FROM_STEP" ]] && return 0
+  [[ "$id" -gt "$TO_STEP" ]] && return 0
+  if [[ -n "$SKIP_LIST" ]]; then
+    case ",$SKIP_LIST," in
+      *",$id,"*) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
+# ── Step idempotency: detect "already done" by per-step sentinel file ────────
+# Returns 0 (done) when the sentinel exists.
+step_already_done() {
+  local id="$1"
+  case "$id" in
+    0)  [[ -f "$MBX_OUT_DIR/0_primer_handling/mbx_primer_info.txt" ]] ;;
+    1)  [[ -s "$MBX_OUT_DIR/1_manifest_file/manifest.txt" ]] ;;
+    2)  [[ -s "$MBX_OUT_DIR/2_first_artifact_file/Paired_End_artifact.qza" ]] ;;
+    3)  [[ -s "$MBX_OUT_DIR/3_dada2_parameters/dada2_parameters.txt" ]] ;;
+    4)  [[ -s "$MBX_OUT_DIR/4_dada2_outputs/feature_table.qza" ]] \
+        && [[ -s "$MBX_OUT_DIR/4_dada2_outputs/representative_sequences.qza" ]] ;;
+    5)  [[ -f "$MBX_OUT_DIR/5_classifier_working_dir/mbx_classifier_run_info.txt" ]] ;;
+    6)  [[ -s "$MBX_OUT_DIR/6_classifier_taxonomy/taxonomy.qza" ]] ;;
+    7)  [[ -f "$MBX_OUT_DIR/7_taxonomy_csv/mbx_taxonomy_info.txt" ]] ;;
+    8)  ls -1 "$MBX_OUT_DIR/8_cleaned_files"/mbX_cleaned_*_level-7/ &>/dev/null \
+        && [[ "$(ls "$MBX_OUT_DIR/8_cleaned_files"/mbX_cleaned_*_level-7/ 2>/dev/null | wc -l)" -gt 0 ]] ;;
+    9)  [[ -f "$MBX_OUT_DIR/9_visualization_entire/mbx_ezviz_info.txt" ]] ;;
+    10) [[ -f "$MBX_OUT_DIR/10_stats/mbx_ezstat_info.txt" ]] ;;
+    11) [[ -f "$MBX_OUT_DIR/11_pre_diversity/mbx_pre_diversity_info.txt" ]] ;;
+    12) [[ -f "$MBX_OUT_DIR/12_alpha_diversity_results/mbx_alpha_diversity_info.txt" ]] ;;
+    13) [[ -f "$MBX_OUT_DIR/13_beta_diversity_results/mbx_beta_diversity_info.txt" ]] ;;
+    14) [[ -f "$MBX_OUT_DIR/14_differential_abundance_ANCOMBC2/mbx_ancombc2_info.txt" ]] ;;
+    15) [[ -f "$MBX_OUT_DIR/15_picrust2/mbx_picrust2_info.txt" ]] ;;
+    16) [[ -f "$MBX_OUT_DIR/16_ml_biomarkers/mbx_ml_biomarkers_info.txt" ]] ;;
+    17) [[ -f "$MBX_OUT_DIR/17_co_occurrence_networks/mbx_networks_info.txt" ]] ;;
+    18) [[ -f "$MBX_OUT_DIR/18_final_report/mbx_final_report_info.txt" ]] ;;
+    *)  return 1 ;;
+  esac
+}
+
+# ── Run a single step with timing + tee'd log ────────────────────────────────
+RUN_RESULTS=""   # accumulates "id|status|seconds" rows for the summary table
+
+run_step() {
+  local id="$1"
+  local title="$2"
+  shift 2
+  local cmd=( "$@" )
+
+  if skip_requested "$id"; then
+    info "Step $id (${title}) -- SKIPPED by user (--from/--to/--skip)"
+    RUN_RESULTS+="$id|SKIPPED|0
+"
+    return 0
+  fi
+
+  if step_already_done "$id"; then
+    info "Step $id (${title}) -- already complete (idempotent skip)"
+    RUN_RESULTS+="$id|CACHED|0
+"
+    return 0
+  fi
+
+  step "$id" "$title"
+  info "Command: ${cmd[*]}"
+  local log="${LOG_DIR}/step_${id}_$(printf '%s' "$title" | tr ' /:' '___').log"
+  info "Log    : $log"
+
+  if $DRY_RUN; then
+    info "[dry-run] would execute the command above"
+    RUN_RESULTS+="$id|DRY|0
+"
+    return 0
+  fi
+
+  local t0; t0="$(date +%s)"
+  set +e
+  "${cmd[@]}" 2>&1 | tee "$log"
+  local rc="${PIPESTATUS[0]}"
+  set -e
+  local t1; t1="$(date +%s)"
+  local secs=$((t1 - t0))
+
+  if [[ "$rc" -eq 0 ]]; then
+    ok   "Step $id finished in ${secs}s"
+    RUN_RESULTS+="$id|OK|$secs
+"
+  else
+    warn "Step $id FAILED (exit code $rc) after ${secs}s"
+    warn "  -> Inspect: $log"
+    RUN_RESULTS+="$id|FAIL|$secs
+"
+    if ! $KEEP_GOING; then
+      err "Aborting pipeline.  Re-run with --resume after fixing the issue,
+  or pass --keep-going to continue past failures."
+    fi
+  fi
+}
+
+# ── Build per-step commands ──────────────────────────────────────────────────
+# The MBX_OUT_DIR env var is exported, so steps 0 and 1 will reuse the same
+# shared directory we just created instead of generating their own timestamp.
+
+# Step 0 -- Primer detection (or manual override)
+STEP0_CMD=( mbx_primer_identifier.sh "$FASTQ_DIR" )
+[[ -n "$FWD_PRIMER" ]] && STEP0_CMD+=( --forward-primer "$FWD_PRIMER" )
+[[ -n "$REV_PRIMER" ]] && STEP0_CMD+=( --reverse-primer "$REV_PRIMER" )
+
+# Step 1 -- Manifest construction
+STEP1_CMD=( create_manifest.sh "$FASTQ_DIR" )
+
+# Step 2 -- QIIME2 .qza artifact creation
+MANIFEST_PATH="${MBX_OUT_DIR}/1_manifest_file/manifest.txt"
+STEP2_CMD=( artifact_creator.sh "$MANIFEST_PATH" )
+
+# Step 3 -- DADA2 truncation parameter finder
+ARTIFACT_PATH="${MBX_OUT_DIR}/2_first_artifact_file/Paired_End_artifact.qza"
+STEP3_CMD=( mbx_dada2_parameter_finder.sh "$ARTIFACT_PATH" )
+
+# Step 4 -- DADA2 denoising
+DADA2_PARAM_PATH="${MBX_OUT_DIR}/3_dada2_parameters/dada2_parameters.txt"
+STEP4_CMD=( mbx_dada2_run.sh "$DADA2_PARAM_PATH" "$META_FILE" )
+
+# Steps 5 -- Greengenes2 download + classifier prep
+STEP5_CMD=( mbx_classifier_arranger.sh "$MBX_OUT_DIR" )
+$SKIP_ZENODO && STEP5_CMD+=( --skip-zenodo )
+
+# Step 6 -- Naive Bayes classification
+STEP6_CMD=( mbx_classifier_run.sh "$MBX_OUT_DIR" )
+
+# Step 7 -- Taxonomy CSVs + mito/chloro filtering
+STEP7_CMD=( mbx_taxonomy_run.sh "$MBX_OUT_DIR" "$META_FILE" )
+
+# Step 8 -- mbX::ezclean per level
+STEP8_CMD=( mbx_ezclean_all_levels.sh "$MBX_OUT_DIR" )
+
+# Step 9 -- mbX::ezviz stacked-bar plots
+STEP9_CMD=( mbx_ezviz_all_levels_all_treatments.sh "$MBX_OUT_DIR" )
+
+# Step 10 -- mbX::ezstat KW + Dunn statistics
+STEP10_CMD=( mbx_ezstat_all_levels_all_treatments.sh "$MBX_OUT_DIR" )
+
+# Step 11 -- Pre-diversity (phylogeny + sampling-depth selection)
+STEP11_CMD=( mbx_pre_diversity_parameters.sh "$MBX_OUT_DIR" )
+
+# Step 12 -- Alpha diversity
+STEP12_CMD=( mbx_alpha_diversity_run.sh "$MBX_OUT_DIR" )
+
+# Step 13 -- Beta diversity (PCoA, PERMANOVA, Adonis)
+STEP13_CMD=( mbx_beta_diversity_run.sh "$MBX_OUT_DIR" )
+
+# Step 14 -- Differential abundance (ANCOMBC2)
+STEP14_CMD=( mbx_ancombc2_run.sh "$MBX_OUT_DIR" )
+
+# Step 15 -- Functional prediction (PICRUSt2)
+STEP15_CMD=( mbx_picrust_run.sh "$MBX_OUT_DIR" )
+
+# Step 16 -- Random Forest biomarker classifier
+STEP16_CMD=( mbx_ml_classifier_run.sh "$MBX_OUT_DIR" )
+
+# Step 17 -- Co-occurrence networks
+STEP17_CMD=( mbx_network_run.sh "$MBX_OUT_DIR" )
+
+# Step 18 -- Consolidated final report (HTML + PDF)
+STEP18_CMD=( mbx_final_report.sh "$MBX_OUT_DIR" )
+$NO_PDF && STEP18_CMD+=( --no-pdf )
+
+# ── EXECUTE ───────────────────────────────────────────────────────────────────
+# Master log captures ALL stdout + stderr from this script and per-step logs.
+exec > >(tee -a "$PIPELINE_LOG") 2>&1
+
+PIPELINE_T0="$(date +%s)"
+
+run_step  0 "Primer detection"                  "${STEP0_CMD[@]}"
+run_step  1 "Manifest construction"             "${STEP1_CMD[@]}"
+run_step  2 "QIIME2 artifact creation"          "${STEP2_CMD[@]}"
+run_step  3 "DADA2 truncation parameters"       "${STEP3_CMD[@]}"
+run_step  4 "DADA2 denoising + ASV inference"   "${STEP4_CMD[@]}"
+run_step  5 "Greengenes2 classifier preparation" "${STEP5_CMD[@]}"
+run_step  6 "Taxonomy classification"           "${STEP6_CMD[@]}"
+run_step  7 "Taxonomy CSVs + mito/chloro filter" "${STEP7_CMD[@]}"
+run_step  8 "mbX::ezclean per level"            "${STEP8_CMD[@]}"
+run_step  9 "mbX::ezviz stacked-bar plots"      "${STEP9_CMD[@]}"
+run_step 10 "mbX::ezstat KW + Dunn statistics"  "${STEP10_CMD[@]}"
+run_step 11 "Pre-diversity (tree + depth)"      "${STEP11_CMD[@]}"
+run_step 12 "Alpha diversity"                   "${STEP12_CMD[@]}"
+run_step 13 "Beta diversity"                    "${STEP13_CMD[@]}"
+run_step 14 "Differential abundance (ANCOMBC2)" "${STEP14_CMD[@]}"
+run_step 15 "Functional prediction (PICRUSt2)"  "${STEP15_CMD[@]}"
+run_step 16 "Random Forest biomarker classifier" "${STEP16_CMD[@]}"
+run_step 17 "Co-occurrence networks"            "${STEP17_CMD[@]}"
+run_step 18 "Consolidated final report"         "${STEP18_CMD[@]}"
+
+PIPELINE_T1="$(date +%s)"
+TOTAL_SECS=$((PIPELINE_T1 - PIPELINE_T0))
+TOTAL_HMS="$(printf '%dh %02dm %02ds' $((TOTAL_SECS/3600)) $((TOTAL_SECS%3600/60)) $((TOTAL_SECS%60)))"
+
+# ── Provenance file ──────────────────────────────────────────────────────────
+{
+  echo "# ============================================================================"
+  echo "# mbXPro_run_info.txt"
+  echo "# Generated by mbXPro orchestrator (step 19 of the mbX Pro pipeline)"
+  echo "# ============================================================================"
+  echo ""
+  echo "# ── Inputs ────────────────────────────────────────────────────────────────────"
+  echo "FASTQ_DIR=$FASTQ_DIR"
+  echo "META_FILE=$META_FILE"
+  echo ""
+  echo "# ── Output directory (the SINGLE shared dir for all 18 steps) ───────────────"
+  echo "MBX_OUT_DIR=$MBX_OUT_DIR"
+  echo ""
+  echo "# ── Software ─────────────────────────────────────────────────────────────────"
+  echo "QIIME2_VERSION=$QIIME_VERSION"
+  echo "RSCRIPT_BIN=$RSCRIPT_BIN"
+  echo "THREADS=$THREADS"
+  echo "BASH_VERSION=$BASH_VERSION"
+  echo "OS=$(uname -srm)"
+  echo ""
+  echo "# ── Run timing ───────────────────────────────────────────────────────────────"
+  echo "RUN_STARTED=$RUN_START"
+  echo "RUN_FINISHED=$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  echo "RUN_DURATION=$TOTAL_HMS"
+  echo "RUN_DURATION_SECONDS=$TOTAL_SECS"
+  echo ""
+  echo "# ── Per-step results (status|seconds) ────────────────────────────────────────"
+  printf '%s' "$RUN_RESULTS" | awk -F'|' 'NF==3 {printf "STEP_%02d_STATUS=%s\nSTEP_%02d_SECONDS=%s\n",$1,$2,$1,$3}'
+  echo ""
+  echo "# ── User-supplied flags ──────────────────────────────────────────────────────"
+  echo "FORWARD_PRIMER_OVERRIDE=${FWD_PRIMER:-(auto-detected)}"
+  echo "REVERSE_PRIMER_OVERRIDE=${REV_PRIMER:-(auto-detected)}"
+  echo "RESUME_MODE=$RESUME"
+  echo "FROM_STEP=$FROM_STEP"
+  echo "TO_STEP=$TO_STEP"
+  echo "SKIPPED_STEPS=${SKIP_LIST:-(none)}"
+  echo "NO_PDF=$NO_PDF"
+  echo "KEEP_GOING=$KEEP_GOING"
+} > "$PROVENANCE"
+
+# ── Final summary ────────────────────────────────────────────────────────────
+N_OK="$(printf '%s' "$RUN_RESULTS" | awk -F'|' '$2=="OK"     {n++} END{print n+0}')"
+N_CC="$(printf '%s' "$RUN_RESULTS" | awk -F'|' '$2=="CACHED" {n++} END{print n+0}')"
+N_SK="$(printf '%s' "$RUN_RESULTS" | awk -F'|' '$2=="SKIPPED"{n++} END{print n+0}')"
+N_FA="$(printf '%s' "$RUN_RESULTS" | awk -F'|' '$2=="FAIL"   {n++} END{print n+0}')"
+
+sep
+cat <<EOM
+
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║                                                                  ║
+  ║                  mbX Pro Pipeline -- COMPLETE                    ║
+  ║                                                                  ║
+  ╚══════════════════════════════════════════════════════════════════╝
+
+  Total runtime    : $TOTAL_HMS  ($TOTAL_SECS s)
+  Steps OK         : $N_OK
+  Steps cached     : $N_CC  (already complete from previous run)
+  Steps skipped    : $N_SK
+  Steps FAILED     : $N_FA
+
+  Output directory : $MBX_OUT_DIR
+  Provenance       : $PROVENANCE
+  Master log       : $PIPELINE_LOG
+
+EOM
+
+if [[ -f "$MBX_OUT_DIR/18_final_report/mbX_pro_final_report.html" ]]; then
+  cat <<EOM
+  >>> FINAL REPORT (open in any browser):
+      $MBX_OUT_DIR/18_final_report/mbX_pro_final_report.html
+
+EOM
+  if [[ -f "$MBX_OUT_DIR/18_final_report/mbX_pro_final_report.pdf" ]]; then
+    cat <<EOM
+  >>> PDF version (publication-ready, A4):
+      $MBX_OUT_DIR/18_final_report/mbX_pro_final_report.pdf
+
+EOM
+  fi
+fi
+
+# ── Per-step results table ───────────────────────────────────────────────────
+echo "  Per-step timeline:"
+printf '  %-4s  %-7s  %s\n' "STEP" "STATUS" "SECONDS"
+printf '  %-4s  %-7s  %s\n' "----" "-------" "-------"
+printf '%s' "$RUN_RESULTS" | awk -F'|' 'NF==3 {printf "  %-4s  %-7s  %s\n",$1,$2,$3}'
+
+sep
+
+# ── Exit with error if anything failed ──────────────────────────────────────
+if [[ "$N_FA" -gt 0 ]]; then
+  exit 2
+fi
+exit 0

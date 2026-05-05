@@ -1,0 +1,30 @@
+# Output directories from analysis runs (never commit user data)
+mbX_pro_outputs_*/
+*_pipeline_log/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Python (only used by docs build pipeline)
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# R intermediate files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Temp / build artefacts
+*.tmp
+*.bak
+/tmp_*
+/build/
