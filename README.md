@@ -22,7 +22,7 @@
 
 ```bash
 # 1. Clone this repo
-git clone https://github.com/<your-username>/mbXPro.git
+git clone https://github.com/utsavlamichhane/mbXPro.git
 cd mbXPro
 
 # 2. Install (copies scripts to ~/bin and adds it to PATH)
